@@ -295,7 +295,7 @@ def format_lead(lead: Dict) -> str:
         f"🔗 Посилання: {lead.get('url', '')}",
         f"💳 Підтримати/оплата: {WALLET_URL}",
     ]
-    return "
+    return "\n".join(parts)
 ".join(parts)
 
 
