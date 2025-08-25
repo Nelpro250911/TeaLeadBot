@@ -29,7 +29,7 @@ import hashlib
 import logging
 import threading
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Optional
 
 import requests
@@ -44,6 +44,7 @@ except Exception:
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 DB_PATH = os.getenv("DB_PATH", "leads.db")
 SCAN_INTERVAL_MIN = int(os.getenv("SCAN_INTERVAL_MIN", "360"))  # каждые 6 часов
+WALLET_URL = os.getenv("WALLET_URL", "https://your.wallet/link")  # ← додай у Render Env Vars
 CITY_NAMES = {"київ", "киев", "kyiv"}
 
 KEYWORDS: List[str] = [
@@ -147,7 +148,7 @@ def save_leads(conn, leads: List[Dict]) -> List[Dict]:
                 "INSERT OR IGNORE INTO leads (id, url, title, price, location, published_at, source, keyword, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     lead["id"], lead["url"], lead.get("title"), lead.get("price"), lead.get("location"),
-                    lead.get("published_at"), lead.get("source", "olx"), lead.get("keyword", ""), datetime.utcnow().isoformat(),
+                    lead.get("published_at"), lead.get("source", "olx"), lead.get("keyword", ""), datetime.now(timezone.utc).isoformat(),
                 ),
             )
             if cur.rowcount == 1:
@@ -166,7 +167,7 @@ def get_subscribers(conn) -> List[str]:
 
 def add_subscriber(conn, chat_id: str):
     cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO subscribers (chat_id, created_at) VALUES (?, ?)", (str(chat_id), datetime.utcnow().isoformat()))
+    cur.execute("INSERT OR IGNORE INTO subscribers (chat_id, created_at) VALUES (?, ?)", (str(chat_id), datetime.now(timezone.utc).isoformat()))
     conn.commit()
 
 # -------------------- Парсер OLX --------------------
@@ -269,6 +270,18 @@ def scan_all_keywords() -> List[Dict]:
     uniq = {x["id"]: x for x in all_leads}
     return list(uniq.values())
 
+# -------------------- Аналітика --------------------
+
+def _count_day(conn, ymd: str) -> int:
+    cur = conn.cursor()
+    return cur.execute("SELECT COUNT(*) FROM leads WHERE date(created_at)=?", (ymd,)).fetchone()[0]
+
+
+def _count_month(conn, ym: str) -> int:
+    cur = conn.cursor()
+    return cur.execute("SELECT COUNT(*) FROM leads WHERE strftime('%Y-%m', created_at)=?", (ym,)).fetchone()[0]
+
+
 # -------------------- Telegram --------------------
 
 def format_lead(lead: Dict) -> str:
@@ -280,8 +293,10 @@ def format_lead(lead: Dict) -> str:
         f"📍 Локація: {lead.get('location', '—')}",
         f"🕒 Оновлено: {lead.get('published_at', '')}",
         f"🔗 Посилання: {lead.get('url', '')}",
+        f"💳 Підтримати/оплата: {WALLET_URL}",
     ]
-    return "\n".join(parts)
+    return "
+".join(parts)
 
 
 def send_to_telegram(bot, chat_id: str, text: str):
@@ -327,11 +342,35 @@ def start_bot(_conn_main_thread):
         return
 
     bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
+    # Очистим вебхук, если активен (во избежание конфликтов polling/webhook)
+    try:
+        bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        logger.warning(f"Webhook delete failed: {e}")
 
     @bot.message_handler(commands=['start', 'help'])
     def handle_start(m):
         conn_h = init_db(DB_PATH)
         add_subscriber(conn_h, m.chat.id)
+        bot.reply_to(m, (
+            "Вітаю! Я бот для пошуку лідів по чаю в Києві.
+
+"
+            "Команди:
+"
+            "/scan — ручний скан зараз
+"
+            "/status — статистика в БД
+"
+            "/stats — щодня та за місяць (з приростом)
+"
+            "/help — довідка
+
+"
+            f"Підтримати/оплата: {WALLET_URL}"
+        ))
+
+            add_subscriber(conn_h, m.chat.id)
         bot.reply_to(m, (
             "Вітаю! Я бот для пошуку лідів по чаю в Києві.\n\n"
             "Команди:\n"
@@ -362,10 +401,75 @@ def start_bot(_conn_main_thread):
         cur = conn_h.cursor()
         c = cur.execute("SELECT COUNT(*) FROM leads").fetchone()[0]
         subs = len(get_subscribers(conn_h))
-        bot.reply_to(m, f"Статистика: {c} лід(ів) у базі. Підписників: {subs}.")
+        bot.reply_to(m, f"Статистика: {c} лід(ів) у базі. Підписників: {subs}.
+💳 Оплата: {WALLET_URL}")
+
+    @bot.message_handler(commands=['stats'])
+    def handle_stats(m):
+        conn_h = init_db(DB_PATH)
+        today = datetime.utcnow().date()
+        ymd_today = today.isoformat()
+        ymd_yest = (today.fromordinal(today.toordinal()-1)).isoformat()
+
+        ym_this = today.strftime('%Y-%m')
+        prev_month = (today.replace(day=1).fromordinal(today.replace(day=1).toordinal()-1))
+        ym_prev = prev_month.strftime('%Y-%m')
+
+        n_today = _count_day(conn_h, ymd_today)
+        n_yest = _count_day(conn_h, ymd_yest)
+        delta_d = n_today - n_yest
+        if delta_d > 0:
+            d_mark = f"🟢 +{delta_d}"
+        elif delta_d < 0:
+            d_mark = f"🔴 {delta_d}"
+        else:
+            d_mark = "⚪︎ 0"
+
+        m_this = _count_month(conn_h, ym_this)
+        m_prev = _count_month(conn_h, ym_prev)
+        delta_m = m_this - m_prev
+        if delta_m > 0:
+            m_mark = f"🟢 +{delta_m}"
+        elif delta_m < 0:
+            m_mark = f"🔴 {delta_m}"
+        else:
+            m_mark = "⚪︎ 0"
+
+        text = (
+            "📊 Статистика лідогенерації
+" 
+            f"📅 Сьогодні ({ymd_today}): {n_today} {d_mark}
+"
+            f"📅 Вчора ({ymd_yest}): {n_yest}
+"
+            f"🗓️ Цей місяць ({ym_this}): {m_this} {m_mark}
+"
+            f"🗓️ Минул. місяць ({ym_prev}): {m_prev}
+"
+            f"💳 Оплата/підтримка: {WALLET_URL}"
+        )
+        bot.reply_to(m, text)
 
     logger.info("Бот запущен. Ожидаю команды…")
-    bot.infinity_polling(skip_pending=True, timeout=30)
+    # Цикл с обработкой 409 Conflict (другая копия бота делает getUpdates)
+    import time as _t
+    from telebot.apihelper import ApiTelegramException as _ApiEx
+    while True:
+        try:
+            bot.infinity_polling(skip_pending=True, timeout=30)
+        except _ApiEx as e:
+            code = getattr(getattr(e, 'result_json', {}), 'get', lambda *_: None)('error_code') if hasattr(e, 'result_json') else None
+            # В старых версиях нет result_json — проверим по тексту
+            is_409 = (code == 409) or ('409' in str(e) and 'getUpdates' in str(e))
+            if is_409:
+                logger.error("409 Conflict: уже идет другой getUpdates. Сплю 60с и пробую снова…")
+                _t.sleep(60)
+                continue
+            logger.error(f"Polling error: {e}. Retry 15с…")
+            _t.sleep(15)
+        except Exception as e:
+            logger.error(f"Polling crash: {e}. Retry 15с…")
+            _t.sleep(15)(skip_pending=True, timeout=30)
 
 # -------------------- Main --------------------
 
