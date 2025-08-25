@@ -296,7 +296,6 @@ def format_lead(lead: Dict) -> str:
         f"💳 Підтримати/оплата: {WALLET_URL}",
     ]
     return "\n".join(parts)
-".join(parts)
 
 
 def send_to_telegram(bot, chat_id: str, text: str):
